@@ -1,0 +1,663 @@
+---
+title: "final_project"
+output: html_document
+date: "2026-06-10"
+editor_options: 
+  chunk_output_type: console
+---
+
+# - - - - - - - - 
+# Data & Packages
+# - - - - - - - - 
+
+```{r}
+# load data
+temp_raw <- read.csv("data/temp_monthly_clean.csv")
+population <- read.csv("data/population.csv")
+stations <- read.csv("data/stations.csv")
+counties <- read.csv("data/counties.csv")
+
+# load packages
+library(ggplot2)
+library(ggthemes)
+library(scales)
+library(ggrepel)
+library(dplyr)
+library(tidyr)
+library(terra)
+library(sf)
+library(exactextractr)
+library(tigris)
+library(car)
+```
+
+# - - - - - - - - - - - - - -
+# Data Cleaning & Aggregation
+# - - - - - - - - - - - - - -
+
+# Air Temperature Data
+```{r}
+# convert to Jan-June 1970 to celsius
+temp_raw_convert <- temp_raw %>%
+  mutate(across(c(emnt, emxt, tavg, tmin, tmax),
+                ~ dplyr::if_else(year == 1970 & month %in% 1:6,
+                                 (.x - 32) * 5/9,
+                                 .x)),
+         across(c(emnt, emxt, tavg, tmin, tmax), ~ round(.x, 1)))
+```
+
+# Population Data
+```{r}
+# convert population data to long format
+population_long <- population %>%
+  rename(county = X) %>%
+  mutate(across(-county, as.character)) %>%
+  pivot_longer(cols = -county,
+               names_to = "year",
+               values_to = "population") %>%
+  mutate(year = as.numeric(sub("^X", "", year)),
+         population = as.integer(gsub(",", "", population)))
+```
+
+# Land Cover Data
+```{r}
+# nlcd data
+cover_rast <- rast("data/Annual_NLCD_LndCov_2020_CU_C1V1.tif")
+
+# counties
+mi_counties <- counties(state = "MI",
+                        cb = TRUE)
+
+# land cover percentage by county
+cover_raw <- exact_extract(cover_rast,
+                           mi_counties,
+                           function(values, coverage_fraction) {
+                             tab <- tapply(coverage_fraction,
+                                           values,
+                                           sum,
+                                           na.rm = TRUE)
+                             prop <- tab / sum(tab)
+                             as.data.frame(t(prop))
+                             },
+                           progress = TRUE)
+
+# land cover table
+cover_county <- cover_raw %>%
+  bind_cols(mi_counties %>%
+              st_drop_geometry() %>%
+              select(GEOID, NAME)) %>%
+  pivot_longer(-c(GEOID, NAME),
+               names_to = "cover_class",
+               values_to = "proportion")
+
+# combine cover classes
+cover_class_lookup <- tibble(
+  cover_class = as.character(c(11,21,22,23,24,31,41,42,43,52,71,81,82,90,95)),
+  category = c("water",
+               "developed","developed","developed","developed",
+               "barren",
+               "forest","forest","forest",
+               "vegetation","vegetation","vegetation","vegetation",
+               "wetlands","wetlands"))
+
+cover_categorized <- cover_county %>%
+  left_join(cover_class_lookup, by = "cover_class") %>%
+  group_by(NAME, category) %>%
+  summarise(proportion = sum(proportion))
+```
+
+# - - - - - - - - - - -
+# Statistical Analysis
+# - - - - - - - - - - -
+
+```{r}
+# ANOVA
+
+# state (all counties) temperature by year
+temp_county_month <- temp_raw_convert %>%
+  group_by(county, year, month) %>%
+  summarize(tavg = mean(tavg))
+
+anova_temp_year <- aov(tavg ~ as.factor(year), data = temp_county_month)
+summary(anova_temp_year)
+TukeyHSD(anova_temp_year)
+
+# state (all counties) temperature by cover category for 2020
+cover_max_cat <- cover_categorized %>%
+  group_by(NAME) %>%
+  filter(proportion == max(proportion)) %>%
+  inner_join(temp_county_month %>%
+               filter(year == "2020"),
+             by = c("NAME" = "county"))
+
+anova_temp_cover <- aov(tavg ~ category, data = cover_max_cat)
+summary(anova_temp_cover)
+TukeyHSD(anova_temp_cover)
+```
+
+```{r}
+# kruskal-wallis
+
+# temperature by county for 2025
+kruskal.test(tavg ~ county, 
+             data = temp_county_month %>%
+               filter(year == "2025"))
+```
+
+```{r}
+# t-test
+
+# temperature between peninsulas
+temp_county_month <- temp_county_month %>%
+  left_join(counties %>%
+              select(c("county", "peninsula")), 
+            by = "county")
+
+t.test(x = temp_county_month %>%
+         filter(peninsula == "lower") %>%
+         pull(tavg),
+       y = temp_county_month %>%
+         filter(peninsula == "upper") %>%
+         pull(tavg),
+       alternative = "two.sided",
+       paired = FALSE)
+```
+
+```{r}
+# regression
+
+# temperature & population for all counties & years
+temp_county_year <- temp_county_month %>%
+  group_by(county, year) %>%
+  summarise(tavg = mean(tavg)) %>%
+  left_join(population_long,
+            by = c("county", "year"))
+
+reg_temp_pop <- lm(tavg ~ population, data = temp_county_year)
+summary(reg_temp_pop)
+plot(reg_temp_pop)
+
+reg_temp_pop_log <- lm(tavg ~ log(population), data = temp_county_year) #better
+summary(reg_temp_pop_log)
+plot(reg_temp_pop_log)
+
+# temperature & cover for all counties for 2020, by category
+cover_cat_wide <- cover_categorized %>%
+  pivot_wider(names_from = category,
+              values_from = proportion) %>%
+  inner_join(temp_county_year %>%
+               filter(year == "2020"),
+             by = c("NAME" = "county"))
+
+# barren
+reg_temp_barren <- lm(tavg ~ barren, data = cover_cat_wide)
+summary(reg_temp_barren)
+plot(reg_temp_barren)
+
+reg_temp_barren_log <- lm(tavg ~ log(barren), 
+                           data = cover_cat_wide %>%
+                             filter(NAME != "Leelanau"))
+summary(reg_temp_barren_log)
+plot(reg_temp_barren_log)
+
+# developed
+reg_temp_dev <- lm(tavg ~ developed, data = cover_cat_wide)
+summary(reg_temp_dev)
+plot(reg_temp_dev)
+
+reg_temp_dev_log <- lm(tavg ~ log(developed), data = cover_cat_wide) 
+summary(reg_temp_dev_log)
+plot(reg_temp_dev_log)
+
+# forest
+reg_temp_forest <- lm(tavg ~ forest, data = cover_cat_wide) 
+summary(reg_temp_forest)
+plot(reg_temp_forest)
+
+reg_temp_forest_log <- lm(tavg ~ log(forest), data = cover_cat_wide)
+summary(reg_temp_forest_log)
+plot(reg_temp_forest_log)
+
+# vegetation
+reg_temp_veg <- lm(tavg ~ vegetation, data = cover_cat_wide) 
+summary(reg_temp_veg)
+plot(reg_temp_veg)
+
+reg_temp_veg_log <- lm(tavg ~ log(vegetation), data = cover_cat_wide) 
+summary(reg_temp_veg_log)
+plot(reg_temp_veg_log)
+
+# water
+reg_temp_water <- lm(tavg ~ water, data = cover_cat_wide)
+summary(reg_temp_water)
+plot(reg_temp_water)
+
+reg_temp_water_log <- lm(tavg ~ log(water), data = cover_cat_wide) 
+summary(reg_temp_water_log)
+plot(reg_temp_water_log)
+
+# wetland
+reg_temp_wet <- lm(tavg ~ wetlands, data = cover_cat_wide)
+summary(reg_temp_wet)
+plot(reg_temp_wet)
+
+reg_temp_wet_log <- lm(tavg ~ log(wetlands), data = cover_cat_wide) 
+summary(reg_temp_wet_log)
+plot(reg_temp_wet_log)
+
+```
+
+```{r}
+# correlation
+
+# temperature & population for all counties & years
+cor.test(temp_county_year$tavg, temp_county_year$population)
+
+# temperature & cover for all counties for 2020, by category
+cor.test(cover_cat_wide$tavg, cover_cat_wide$barren)
+cor.test(cover_cat_wide$tavg, cover_cat_wide$developed)
+cor.test(cover_cat_wide$tavg, cover_cat_wide$forest)
+cor.test(cover_cat_wide$tavg, cover_cat_wide$vegetation)
+cor.test(cover_cat_wide$tavg, cover_cat_wide$water)
+cor.test(cover_cat_wide$tavg, cover_cat_wide$wetlands)
+```
+
+# - - - - - - - -
+# Visualizations
+# - - - - - - - -
+
+```{r}
+# bar graph
+
+# temperature by calendar month
+temp_state_month <- temp_raw_convert %>%
+  group_by(year, month) %>%
+  summarize(tavg = mean(tavg)) %>%
+  mutate(date = as.Date(paste(year, month, "01", sep = "-"),
+                        format = "%Y-%m-%d"))
+
+temp_cal_month <- temp_state_month %>%
+  group_by(month) %>%
+  summarise(tavg = mean(tavg)) %>%
+  mutate(month = factor(month,
+                        levels = 1:12,
+                        labels = c("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")))
+
+ggplot(temp_cal_month, aes(month, tavg)) +
+  geom_col() +
+  scale_y_continuous(breaks = breaks_width(5)) +
+  labs(x = "Month",
+       y = "Air Temperature (ºC)",
+       title = "Michigan Average Air Temperature by Calendar Month") +
+  theme_stata()
+
+# temperature by year
+ggplot(temp_state_month %>%
+         group_by(year) %>%
+         summarise(tavg = mean(tavg)),
+       aes(year, tavg)) +
+  geom_col() +
+  scale_y_continuous(breaks = breaks_width(5)) +
+  labs(x = "Year",
+       y = "Air Temperature (ºC)",
+       title = "Michigan Average Air Temperature by Year") +
+  theme_stata()
+
+# stations by year
+stations_year <- temp_raw_convert %>%
+  group_by(station, year) %>%
+  summarise(tavg = mean(tavg)) %>%
+  group_by(year) %>%
+  summarise(n = n())
+
+ggplot(stations_year, aes(year, n)) +
+  geom_col() +
+  scale_x_continuous(breaks = breaks_width(10)) +
+  labs(x = "Year",
+       y = "Stations",
+       title = "Number of Air Temperature Stations by Year") +
+  theme_stata()
+
+# state population by year
+ggplot(population_long %>%
+         filter(county == "Michigan"),
+       aes(year, population)) +
+  geom_col() +
+  scale_x_continuous(breaks = breaks_width(10)) +
+  labs(x = "Year",
+       y = "State Population",
+       title = "Michigan Population by Year") +
+  theme_stata()
+```
+
+```{r}
+# histogram
+
+# barren
+ggplot(cover_cat_wide, aes(barren)) +
+  geom_histogram(binwidth = 0.002) +
+  labs(x = "Barren Land Proportion",
+       y = "Number of Counties",
+       title = "Histogram of 2020 Michigan County Barren Land Proportion",
+       subtitle = "NLCD Land Cover Class 31: Barren Land") +
+  theme_stata()
+
+# developed
+ggplot(cover_cat_wide, aes(developed)) +
+  geom_histogram(binwidth = 0.04) +
+  labs(x = "Developed Land Proportion",
+       y = "Number of Counties",
+       title = "Histogram of 2020 Michigan County Developed Land Proportion",
+       subtitle = "NLCD Land Cover Classes 21-24: Developed - Open Space, Low Intensity, Medium Intensity, High Intensity") +
+  theme_stata()
+
+# forest
+ggplot(cover_cat_wide, aes(forest)) +
+  geom_histogram(binwidth = 0.04) +
+  labs(x = "Forest Proportion",
+       y = "Number of Counties",
+       title = "Histogram of 2020 Michigan County Forest Proportion",
+       subtitle = "NLCD Land Cover Classes 41-43: Forest - Deciduous, Evergreen, Mixed") +
+  theme_stata()
+
+# vegetation
+ggplot(cover_cat_wide, aes(vegetation)) +
+  geom_histogram(binwidth = 0.04) +
+  labs(x = "Vegetation Proportion",
+       y = "Number of Counties",
+       title = "Histogram of 2020 Michigan County Vegetation Proportion",
+       subtitle = "NLCD Land Cover Classes 52, 71, 81-82: Shrub, Grassland, Pasture, Cultivated Crops") +
+  theme_stata()
+
+# water
+ggplot(cover_cat_wide, aes(water)) +
+  geom_histogram(binwidth = 0.01) +
+  labs(x = "Water Proportion",
+       y = "Number of Counties",
+       title = "Histogram of 2020 Michigan County Water Proportion",
+       subtitle = "NLCD Land Cover Class 11: Open Water") +
+  theme_stata()
+
+# wetland
+ggplot(cover_cat_wide, aes(wetlands)) +
+  geom_histogram(binwidth = 0.04) +
+  labs(x = "Wetland Proportion",
+       y = "Number of Counties",
+       title = "Histogram of 2020 Michigan County Wetland Proportion",
+       subtitle = "NLCD Land Cover Classes 90 & 95: Wetlands - Woody, Emergent Herbaceous") +
+  theme_stata()
+```
+
+```{r}
+# scatterplot
+
+# temperature by population
+ggplot(temp_county_year, aes(log(population), tavg)) +
+  geom_point() +
+  labs(x = "County Population (log)",
+       y = "Air Temperature (ºC)",
+       title = "Average Annual Air Temperature by Michigan County Population (log)") +
+  theme_stata()
+
+# temperature by population, upper & lower peninsula
+temp_county_year <- temp_county_year %>%
+  left_join(counties %>%
+              select(county, peninsula),
+            by = "county")
+
+ggplot(temp_county_year, aes(log(population), tavg, color = peninsula)) +
+  geom_point(alpha = 0.4) +
+  labs(x = "County Population (log)",
+       y = "Air Temperature (ºC)",
+       title = "Average Annual Air Temperature by Michigan County Population (log) and Peninsula") +
+  theme_stata()
+
+# temperature by population, land cover category
+temp_county_year <- temp_county_year %>%
+  left_join(cover_max_cat %>%
+              group_by(NAME, category) %>%
+              summarise(tavg = mean(tavg)) %>%
+              select(NAME, category),
+            by = c("county" = "NAME"))
+
+ggplot(temp_county_year, aes(log(population), tavg, color = category)) +
+  geom_point(alpha = 0.3) +
+  labs(x = "County Population (log)",
+       y = "Air Temperature (ºC)",
+       title = "Average Annual Air Temperature by Michigan County Population (log) and Land Cover Category",
+       subtitle = "County land cover category determined by category with highest land cover proportion in that county",
+       color = "Land Cover Category") +
+  theme_stata()
+
+# temperature by barren land cover
+ggplot(cover_cat_wide, aes(barren, tavg)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Barren Land Proportion",
+       y = "Air Temperature (ºC)",
+       title = "Average 2020 Air Temperature by Michigan County Barren Land Proportion") +
+  theme_stata()
+
+ggplot(cover_cat_wide, aes(log(barren), tavg)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Barren Land Proportion (log)",
+       y = "Air Temperature (ºC)",
+       title = "Average 2020 Air Temperature by Michigan County Barren Land Proportion (log)") +
+  theme_stata()
+
+# temperature by developed land cover
+ggplot(cover_cat_wide, aes(developed, tavg)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Developed Land Proportion",
+       y = "Air Temperature (ºC)",
+       title = "Average 2020 Air Temperature by Michigan County Developed Land Proportion") +
+  theme_stata()
+
+ggplot(cover_cat_wide, aes(log(developed), tavg)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Developed Land Proportion (log)",
+       y = "Air Temperature (ºC)",
+       title = "Average 2020 Air Temperature by Michigan County Developed Land Proportion (log)") +
+  theme_stata()
+
+# temperature by forest land cover
+ggplot(cover_cat_wide, aes(forest, tavg)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Forest Proportion",
+       y = "Air Temperature (ºC)",
+       title = "Average 2020 Air Temperature by Michigan County Forest Proportion") +
+  theme_stata()
+
+ggplot(cover_cat_wide, aes(log(forest), tavg)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Forest Proportion (log)",
+       y = "Air Temperature (ºC)",
+       title = "Average 2020 Air Temperature by Michigan County Forest Proportion (log)") +
+  theme_stata()
+
+# temperature by vegetation land cover
+ggplot(cover_cat_wide, aes(vegetation, tavg)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Vegetation Proportion",
+       y = "Air Temperature (ºC)",
+       title = "Average 2020 Air Temperature by Michigan County Vegetation Proportion") +
+  theme_stata()
+
+ggplot(cover_cat_wide, aes(log(vegetation), tavg)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Vegetation Proportion (log)",
+       y = "Air Temperature (ºC)",
+       title = "Average 2020 Air Temperature by Michigan County Vegetation Proportion (log)") +
+  theme_stata()
+
+# temperature by water land cover
+ggplot(cover_cat_wide, aes(water, tavg)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Water Proportion",
+       y = "Air Temperature (ºC)",
+       title = "Average 2020 Air Temperature by Michigan County Water Proportion") +
+  theme_stata()
+
+ggplot(cover_cat_wide, aes(log(water), tavg)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Water Proportion (log)",
+       y = "Air Temperature (ºC)",
+       title = "Average 2020 Air Temperature by Michigan County Water Proportion (log)") +
+  theme_stata()
+
+# temperature by wetland land cover
+ggplot(cover_cat_wide, aes(wetlands, tavg)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Wetland Proportion",
+       y = "Air Temperature (ºC)",
+       title = "Average 2020 Air Temperature by Michigan County Wetland Proportion") +
+  theme_stata()
+
+ggplot(cover_cat_wide, aes(log(wetlands), tavg)) +
+  geom_point() +
+  geom_smooth(method = "lm", se = FALSE) +
+  labs(x = "Wetland Proportion (log)",
+       y = "Air Temperature (ºC)",
+       title = "Average 2020 Air Temperature by Michigan County Wetland Proportion (log)") +
+  theme_stata()
+```
+
+```{r}
+# line graph
+
+# 2025 monthly temperature by peninsula
+ggplot(temp_county_month %>%
+         filter(year == "2025") %>%
+         group_by(month, peninsula) %>%
+         summarise(tavg = mean(tavg)),
+       aes(month, tavg, color = peninsula)) +
+  geom_line() +
+  scale_x_continuous(breaks = 1:12, labels = month.abb) +
+  labs(x = "Month",
+       y = "Air Temperature (ºC)",
+       title = "Average 2025 Air Temperature by Month and Peninsula") +
+  theme_stata()
+```
+
+```{r}
+# map
+
+# stations plotted
+stations_sf <- stations %>%
+  filter(latitude != "#N/A" & longitude != "#N/A") %>%
+  st_as_sf(coords = c("longitude", "latitude"), crs = 4326)
+
+ggplot() +
+  geom_sf(data = mi_counties, fill = "white") +
+  geom_sf(data = stations_sf, color = "black", size = 1.2, alpha = .8) +
+  coord_sf() +
+  labs(title = "Michigan Air Temperature Stations Map") +
+  theme_stata()
+
+# prepare mapping dataset
+cover_max_cat_all <- cover_categorized %>%
+  group_by(NAME) %>%
+  filter(proportion == max(proportion))
+
+cover_cat_wide_all <- cover_categorized %>%
+  pivot_wider(names_from = category,
+              values_from = proportion)
+
+county_map_data <- mi_counties %>%
+  left_join(cover_max_cat_all,
+            by = "NAME") %>%
+  left_join(population_long %>%
+              filter(year == "2025") %>%
+              select(population, county),
+            by = c("NAME" = "county")) %>%
+  left_join(cover_cat_wide_all %>%
+              select(barren, developed, forest, vegetation, water, wetlands, NAME),
+            by = "NAME") %>%
+  left_join(temp_county_year %>%
+              filter(year == "2025") %>%
+              select(tavg, county),
+            by = c("NAME" = "county")) %>%
+  st_as_sf()
+  
+# county by temp (2025)
+ggplot(county_map_data) +
+  geom_sf(aes(fill = tavg), color = "black", alpha = 0.8) +
+  coord_sf() +
+  scale_fill_gradient(low = "white", high = "red") +
+  labs(title = "Michigan County by 2025 Average Air Temperature Map",
+       fill = "Temperature (ºC)") +
+  theme_stata()
+
+# county by land cover
+ggplot(county_map_data) +
+  geom_sf(aes(fill = category), color = "black", alpha = 0.8) +
+  coord_sf() +
+  labs(title = "Michigan County by 2020 Land Cover Category Map",
+       subtitle = "County land cover category determined by category\nwith highest land cover proportion in that county",
+       fill = "Land Cover Category") +
+  theme_stata()
+
+# county by barren land cover
+ggplot(county_map_data) +
+  geom_sf(aes(fill = barren), color = "black", alpha = 1) +
+  coord_sf() +
+    scale_fill_gradient(low = "white", high = "orange") +
+  labs(title = "Michigan County by Barren Land Cover Map",
+       fill = "Barren Proportion") +
+  theme_stata()
+
+# county by developed land cover
+ggplot(county_map_data) +
+  geom_sf(aes(fill = developed), color = "black", alpha = 1) +
+  coord_sf() +
+    scale_fill_gradient(low = "white", high = "pink") +
+  labs(title = "Michigan County by Developed Land Cover Map",
+       fill = "Developed Proportion") +
+  theme_stata()
+
+# county by forest cover
+ggplot(county_map_data) +
+  geom_sf(aes(fill = forest), color = "black", alpha = 1) +
+  coord_sf() +
+    scale_fill_gradient(low = "white", high = "darkgreen") +
+  labs(title = "Michigan County by Forest Land Cover Map",
+       fill = "Forest Proportion") +
+  theme_stata()
+
+# county by vegetation cover
+ggplot(county_map_data) +
+  geom_sf(aes(fill = vegetation), color = "black", alpha = 1) +
+  coord_sf() +
+    scale_fill_gradient(low = "white", high = "turquoise") +
+  labs(title = "Michigan County by Vegetation Land Cover Map",
+       fill = "Vegetation Proportion") +
+  theme_stata()
+
+# county by wetland cover
+ggplot(county_map_data) +
+  geom_sf(aes(fill = wetlands), color = "black", alpha = 1) +
+  coord_sf() +
+    scale_fill_gradient(low = "white", high = "purple") +
+  labs(title = "Michigan County by Wetland Land Cover Map",
+       fill = "Wetland Proportion") +
+  theme_stata()
+
+# county by water cover
+ggplot(county_map_data) +
+  geom_sf(aes(fill = water), color = "black", alpha = 1) +
+  coord_sf() +
+    scale_fill_gradient(low = "white", high = "yellow") +
+  labs(title = "Michigan County by Water Land Cover Map",
+       fill = "Water Proportion") +
+  theme_stata()
+```
